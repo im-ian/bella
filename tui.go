@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -17,11 +18,13 @@ type screen struct {
 	height   int
 	agents   []Agent
 	input    []rune
-	pending  *Decision
+	live     *liveRun
+	scroll   int
 	settings bool
 	cursor   int
 	mode     string
 	notice   string
+	frame    int
 }
 
 type key struct {
@@ -44,34 +47,130 @@ func runTUI() error {
 	}
 	fd := int(os.Stdin.Fd())
 	defer term.Restore(fd, state)
-	fmt.Fprint(os.Stdout, "\x1b[?1049h")
-	defer fmt.Fprint(os.Stdout, "\x1b[?1049l\x1b[?25h")
+	// Alternate screen, wrap off. A line as wide as the terminal would
+	// otherwise wrap and shove the next row down.
+	fmt.Fprint(os.Stdout, "\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H")
+	defer fmt.Fprint(os.Stdout, "\x1b[?1049l\x1b[?7h\x1b[?25h")
 
 	var input []rune
-	var pending *Decision
+	var live *liveRun
 	settings := false
 	cursor := 0
+	scroll := 0
 	notice := ""
+	shown := -1
+	caretRow, caretCol := 0, 0
+	loaderRow := 0
+	defer func() {
+		if live != nil {
+			live.stop()
+		}
+	}()
 	for {
 		width, height, err := term.GetSize(int(os.Stdout.Fd()))
-		if err != nil || width < 20 {
+		if err != nil || width < 8 {
 			width = 80
 		}
-		if height < 12 {
+		if err != nil || height < 4 {
 			height = 24
 		}
-		if _, err := os.Stdout.WriteString(render(screen{
+		frame := int(time.Now().UnixMilli() / 200)
+		text, row, col, load := paint(screen{
 			width: width, height: height, agents: agents, input: input,
-			pending: pending, settings: settings, cursor: cursor, mode: cfg.Mode, notice: notice,
-		})); err != nil {
+			live: live, scroll: scroll, settings: settings, cursor: cursor, mode: cfg.Mode, notice: notice,
+			frame: frame,
+		})
+		caretRow, caretCol, loaderRow = row, col, load
+		if _, err := os.Stdout.WriteString(text); err != nil {
 			return err
 		}
-		k, err := readKey(fd)
-		if err != nil {
-			return err
+		shown = frame
+		var k key
+		var kind string
+		for {
+			k, kind, err = nextEvent(fd, live, !settings)
+			if err != nil {
+				return err
+			}
+			if kind != "tick" {
+				// Typing stays on the prompt line. A full frame moves the
+				// cursor through every row, and the caret follows it.
+				if kind == "key" && !settings && caretRow > 0 {
+					if next, patch, col, ok := inputEditPatch(input, k, caretCol, width); ok {
+						input = next
+						caretCol = col
+						if patch != "" {
+							if _, err := os.Stdout.WriteString(patch); err != nil {
+								return err
+							}
+						}
+						continue
+					}
+				}
+				break
+			}
+			// The spark only changes. A full repaint would hide and show the
+			// cursor and restart its blink on every tick.
+			frame = int(time.Now().UnixMilli() / 200)
+			if frame == shown || settings {
+				continue
+			}
+			shown = frame
+			if _, err := os.Stdout.WriteString(framePatch(frame, caretRow, caretCol, loaderRow)); err != nil {
+				return err
+			}
+		}
+		if kind == "output" {
+			continue
 		}
 		if k.r == 3 || k.r == 4 {
+			if live != nil {
+				live.stop()
+			}
 			return nil
+		}
+		if live != nil {
+			switch {
+			case k.special == "esc":
+				live.stop()
+				live = nil
+				input = nil
+				scroll = 0
+				notice = ""
+			case k.special == "up":
+				scroll++
+			case k.special == "down":
+				if scroll > 0 {
+					scroll--
+				}
+			case k.r == '\r' || k.r == '\n':
+				if !live.finished() {
+					continue
+				}
+				text := strings.TrimSpace(string(input))
+				if text == "" {
+					continue
+				}
+				if err := live.reply(text); err != nil {
+					notice = err.Error()
+					continue
+				}
+				input = nil
+				scroll = 0
+				notice = ""
+			case k.r == 127, k.r == 8:
+				if len(input) > 0 {
+					input = input[:len(input)-1]
+				}
+			default:
+				if k.r < 32 || k.special != "" {
+					continue
+				}
+				if len(input) < 4000 {
+					input = append(input, k.r)
+				}
+			}
+			continue
 		}
 		if settings {
 			rows := settingRows()
@@ -109,10 +208,6 @@ func runTUI() error {
 			continue
 		}
 		if k.special == "esc" {
-			if pending != nil {
-				pending = nil
-				continue
-			}
 			input = nil
 			continue
 		}
@@ -126,10 +221,6 @@ func runTUI() error {
 			} else {
 				notice = ""
 			}
-			if pending != nil {
-				decision := decide(string(input), agents, cfg)
-				pending = &decision
-			}
 			continue
 		}
 		if k.r == 19 { // ctrl-s
@@ -140,31 +231,30 @@ func runTUI() error {
 		}
 		switch k.r {
 		case '\r', '\n':
-			if pending != nil {
-				if !pending.Found {
-					pending = nil
-					continue
-				}
-				term.Restore(int(os.Stdin.Fd()), state)
-				fmt.Fprint(os.Stdout, "\x1b[?1049l\x1b[?25h")
-				fmt.Println(formatDecision(*pending))
-				return handoff(pending.Agent, string(input))
-			}
 			task := strings.TrimSpace(string(input))
 			if task == "" {
 				continue
 			}
 			decision := decide(task, agents, cfg)
-			pending = &decision
-		case 127, 8:
-			if pending != nil {
+			if !decision.Found {
+				notice = decision.Reason
 				continue
 			}
+			run, err := startRun(decision.Agent, task)
+			if err != nil {
+				notice = err.Error()
+				continue
+			}
+			live = run
+			input = nil
+			scroll = 0
+			notice = ""
+		case 127, 8:
 			if len(input) > 0 {
 				input = input[:len(input)-1]
 			}
 		default:
-			if pending != nil || k.r < 32 || k.special != "" {
+			if k.r < 32 || k.special != "" {
 				continue
 			}
 			if len(input) < 4000 {
@@ -229,28 +319,87 @@ func setAgent(cfg *Config, agents []Agent, name string, on bool) error {
 }
 
 func render(s screen) string {
+	text, _, _, _ := paint(s)
+	return text
+}
+
+func paint(s screen) (string, int, int, int) {
 	var lines []string
-	row, col := 0, 0
+	row, col, loader := 0, 0, 0
 	if s.settings {
 		lines = renderSettings(s)
+	} else if s.live != nil {
+		lines, row, col, loader = renderTalk(s)
 	} else {
 		lines, row, col = renderHome(s)
 	}
+	if s.height > 0 && len(lines) > s.height {
+		drop := len(lines) - s.height
+		lines = lines[drop:]
+		if row > 0 {
+			row -= drop
+			if row < 1 {
+				row, col = 0, 0
+			}
+		}
+		if loader > 0 {
+			loader -= drop
+			if loader < 1 {
+				loader = 0
+			}
+		}
+	}
 	var b strings.Builder
-	// Hide the cursor while painting so it does not sit on the footer,
-	// then put the real cursor on the text that was just typed.
-	b.WriteString("\x1b[?25l\x1b[H")
-	b.WriteString(strings.Join(lines, "\r\n"))
+	// Synchronized update keeps the cursor from being shown at each row
+	// while the frame is painted. A plain home move is visible on every key.
+	b.WriteString("\x1b[?2026h\x1b[?1049h\x1b[?7l\x1b[?25l")
+	for i, line := range lines {
+		fmt.Fprintf(&b, "\x1b[%d;1H\x1b[2K%s", i+1, fitLine(line, s.width))
+	}
 	b.WriteString("\x1b[J")
 	if row > 0 && col > 0 {
 		fmt.Fprintf(&b, "\x1b[%d;%dH\x1b[?25h", row, col)
 	}
+	b.WriteString("\x1b[?2026l")
+	return b.String(), row, col, loader
+}
+
+func wordmarkPatch(frame, row, col int) string {
+	return framePatch(frame, row, col, 0)
+}
+
+func framePatch(frame, row, col, loaderRow int) string {
+	var b strings.Builder
+	b.WriteString("\x1b[?2026h\x1b[?25l\x1b[1;1H")
+	b.WriteString(wordmark(frame))
+	if loaderRow > 0 {
+		fmt.Fprintf(&b, "\x1b[%d;1H\x1b[2K%s", loaderRow, loaderLine(frame))
+	}
+	if row > 0 && col > 0 {
+		fmt.Fprintf(&b, "\x1b[%d;%dH\x1b[?25h", row, col)
+	}
+	b.WriteString("\x1b[?2026l")
 	return b.String()
+}
+
+func loaderLine(frame int) string {
+	spins := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	colors := []string{"240", "245", "252", "255", "252", "245"}
+	spin := spins[frame%len(spins)]
+	color := colors[frame%len(colors)]
+	return answerPrefix() + "\x1b[38;5;" + color + "m" + spin + "\x1b[0m"
+}
+
+func fitLine(s string, width int) string {
+	if width < 1 || visibleWidth(s) <= width {
+		return s
+	}
+	return clipWidth(stripANSI(s), width)
 }
 
 func renderHome(s screen) ([]string, int, int) {
 	top := []string{
-		"\x1b[1mbella\x1b[0m",
+		wordmark(s.frame),
 		dim(strings.Repeat("─", s.width)),
 		modeChips(s.mode),
 		"",
@@ -261,41 +410,299 @@ func renderHome(s screen) ([]string, int, int) {
 	for _, agent := range s.agents {
 		top = append(top, agentHomeLine(agent))
 	}
-	var body []string
-	footer := dim("tab mode    enter choose    ^S settings    ^C quit")
-	caretCol := 0
-	if s.pending != nil {
-		body = decisionBody(*s.pending, s.width-4)
-		if s.pending.Found {
-			footer = dim("tab mode    enter hand off    esc cancel    ^C quit")
-		} else {
-			footer = dim("esc close    ^C quit")
-		}
-	} else {
-		content, col := composerContent(string(s.input), s.width)
-		body = []string{content}
-		caretCol = col
-	}
-	title := "task"
-	if s.pending != nil {
-		title = "hand off"
-	}
-	bottom := roundedBox(title, body, s.width)
+	footer := dim("tab mode    enter run    ^S settings    ^C quit")
+	content, caretCol := composerLine(string(s.input), s.width)
+	bottom := promptBlock(content, "", s.width)
 	if s.notice != "" {
 		bottom = append(bottom, dim(s.notice))
 	}
 	bottom = append(bottom, "", footer)
-	lines, bottomAt := pin(top, bottom, s.height)
-	if caretCol == 0 {
-		return lines, 0, 0
+	lines, promptAt := pin(top, bottom, s.height)
+	// promptAt is the rule above the prompt.
+	return lines, promptAt + 2, caretCol
+}
+
+func renderTalk(s screen) ([]string, int, int, int) {
+	agent := talkAgent(s)
+	model, effort := s.live.status()
+	header := []string{
+		wordmark(s.frame),
+		dim(strings.Repeat("─", s.width)),
+		"",
 	}
-	// bottomAt is the box top. The typed text is the next row.
-	return lines, bottomAt + 2, caretCol
+	content, caretCol := composerLine(string(s.input), s.width)
+	bottom := promptBlock(content, composerTitle(agent.Name, model, effort, s.width), s.width)
+	if s.notice != "" {
+		bottom = append(bottom, dim(s.notice))
+	}
+	footer := dim("enter reply    esc back    ↑↓ scroll    ^C quit")
+	if !s.live.finished() {
+		footer = dim("running    esc back    ↑↓ scroll    ^C quit")
+	}
+	bottom = append(bottom, "", footer)
+	room := s.height - len(header) - len(bottom)
+	if room < 0 {
+		room = 0
+	}
+	transcript, loaderAt := transcriptBody(s.live.snapshot(), s.width, room, s.scroll, s.frame, !s.live.finished())
+	for len(transcript) < room {
+		transcript = append(transcript, "")
+	}
+	lines := append(append([]string{}, header...), transcript...)
+	promptAt := len(lines)
+	lines = append(lines, bottom...)
+	loaderRow := 0
+	if loaderAt >= 0 {
+		loaderRow = len(header) + loaderAt + 1
+	}
+	return lines, promptAt + 2, caretCol, loaderRow
+}
+
+func blankLine(lines *[]string) {
+	if len(*lines) > 0 && (*lines)[len(*lines)-1] != "" {
+		*lines = append(*lines, "")
+	}
+}
+
+func answerPrefix() string {
+	return "\x1b[38;5;240m▎\x1b[0m "
+}
+
+func talkAgent(s screen) Agent {
+	for _, agent := range s.agents {
+		if agent.Name == s.live.agent {
+			return agent
+		}
+	}
+	agent := s.live.src
+	agent.Name = s.live.agent
+	if agent.Bin == "" {
+		agent.Bin = s.live.agent
+	}
+	return agent
+}
+
+func transcriptBody(lines []transcriptLine, width, room, scroll, frame int, loading bool) ([]string, int) {
+	if width < 1 {
+		width = 1
+	}
+	if room < 1 {
+		return nil, -1
+	}
+	var wrapped []string
+	afterUser := false
+	for _, line := range lines {
+		text := cleanTerm(line.text)
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		if line.kind == "user" {
+			if len(wrapped) > 0 {
+				blankLine(&wrapped)
+			}
+			wrapped = append(wrapped, stampRows(text, width, width, line.at, func(row string) string {
+				return "\x1b[1m" + row + "\x1b[0m"
+			})...)
+			afterUser = true
+			continue
+		}
+		if afterUser {
+			blankLine(&wrapped)
+			afterUser = false
+		}
+		if line.kind == "tool" {
+			text = "▸ " + text
+		}
+		bodyWidth := width - 2
+		if bodyWidth < 1 {
+			bodyWidth = 1
+		}
+		when := time.Time{}
+		if line.kind == "text" || line.kind == "error" {
+			when = line.at
+		}
+		wrapped = append(wrapped, stampRows(text, width, bodyWidth, when, func(row string) string {
+			switch line.kind {
+			case "meta", "tool":
+				row = dim(row)
+			case "error":
+				row = "\x1b[31m" + row + "\x1b[0m"
+			}
+			return answerPrefix() + row
+		})...)
+	}
+	loaderAt := -1
+	if loading && scroll == 0 {
+		if afterUser {
+			blankLine(&wrapped)
+		}
+		if room > 0 && (len(wrapped) < room || afterUser) {
+			if len(wrapped) >= room {
+				wrapped = wrapped[:room-1]
+			}
+			loaderAt = len(wrapped)
+			wrapped = append(wrapped, loaderLine(frame))
+		}
+	}
+	if len(wrapped) == 0 {
+		return []string{dim("running")}, -1
+	}
+	if len(wrapped) <= room {
+		return wrapped, loaderAt
+	}
+	end := len(wrapped) - scroll
+	if end < room {
+		end = room
+	}
+	if end > len(wrapped) {
+		end = len(wrapped)
+	}
+	start := end - room
+	if start < 0 {
+		start = 0
+	}
+	if loaderAt >= 0 {
+		if loaderAt < start || loaderAt >= end {
+			loaderAt = -1
+		} else {
+			loaderAt -= start
+		}
+	}
+	return wrapped[start:end], loaderAt
+}
+
+func stampRows(text string, screenWidth, contentWidth int, at time.Time, paint func(string) string) []string {
+	when := ""
+	if !at.IsZero() {
+		when = at.Format("15:04")
+	}
+	var rows []string
+	first := true
+	for _, part := range strings.Split(text, "\n") {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		remain := part
+		for remain != "" {
+			room := contentWidth
+			if first && when != "" {
+				room -= strWidth(when) + 1
+				if room < 1 {
+					room = 1
+				}
+			}
+			var row string
+			row, remain = takeWidth(remain, room)
+			painted := paint(row)
+			if first && when != "" {
+				painted = withRightMeta(painted, when, screenWidth)
+			}
+			rows = append(rows, painted)
+			first = false
+		}
+	}
+	return rows
+}
+
+func withRightMeta(left, meta string, width int) string {
+	metaW := strWidth(meta)
+	if metaW == 0 || metaW >= width {
+		return left
+	}
+	padN := width - visibleWidth(left) - metaW
+	if padN < 1 {
+		padN = 1
+	}
+	return left + strings.Repeat(" ", padN) + dim(meta)
+}
+
+func takeWidth(s string, width int) (string, string) {
+	if s == "" || width < 1 {
+		return "", s
+	}
+	w := 0
+	i := 0
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		rw := runeWidth(r)
+		if w+rw > width && i > 0 {
+			break
+		}
+		w += rw
+		i += size
+		if w >= width {
+			break
+		}
+	}
+	return s[:i], s[i:]
+}
+
+func wordmark(frame int) string {
+	marks := []struct {
+		glyph string
+		color string
+	}{
+		{"·", "240"},
+		{"✦", "245"},
+		{"✧", "252"},
+		{"✶", "255"},
+		{"✧", "252"},
+		{"✦", "245"},
+	}
+	mark := marks[frame%len(marks)]
+	return "\x1b[38;5;" + mark.color + "m" + mark.glyph + "\x1b[0m \x1b[1mBella\x1b[0m"
+}
+
+func nextEvent(stdin int, live *liveRun, animate bool) (key, string, error) {
+	var notify *os.File
+	if live != nil {
+		notify = live.notifyR
+	}
+	for {
+		var set unix.FdSet
+		set.Set(stdin)
+		maxfd := stdin
+		nfd := -1
+		if notify != nil {
+			nfd = int(notify.Fd())
+			set.Set(nfd)
+			if nfd > maxfd {
+				maxfd = nfd
+			}
+		}
+		var timeout *unix.Timeval
+		if animate {
+			timeout = &unix.Timeval{Usec: 200_000}
+		}
+		n, err := unix.Select(maxfd+1, &set, nil, nil, timeout)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return key{}, "", err
+		}
+		if n == 0 {
+			return key{}, "tick", nil
+		}
+		if nfd >= 0 && set.IsSet(nfd) {
+			buf := make([]byte, 256)
+			got, readErr := notify.Read(buf)
+			if got == 0 || readErr == io.EOF {
+				if live.notifyR == notify {
+					live.notifyR = nil
+				}
+				notify.Close()
+			}
+			return key{}, "output", nil
+		}
+		k, err := readKey(stdin)
+		return k, "key", err
+	}
 }
 
 func renderSettings(s screen) []string {
 	top := []string{
-		headerLine("bella", "settings", s.width),
+		headerLine("Bella", "settings", s.width),
 		dim(strings.Repeat("─", s.width)),
 		"",
 		dim("agents"),
@@ -333,6 +740,89 @@ func renderSettings(s screen) []string {
 	bottom = append(bottom, "", footer)
 	lines, _ := pin(top, bottom, s.height)
 	return lines
+}
+
+func composerTitle(agent, model, effort string, width int) string {
+	var parts []string
+	if name := strings.TrimSpace(agent); name != "" {
+		parts = append(parts, name)
+	}
+	if pretty := prettyModel(model); pretty != "" {
+		parts = append(parts, pretty)
+	}
+	if text := strings.TrimSpace(effort); text != "" {
+		parts = append(parts, text)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return labeledRule(strings.Join(parts, "  "), width)
+}
+
+func labeledRule(label string, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	label = strings.TrimSpace(label)
+	if label == "" || width < 4 {
+		return dim(strings.Repeat("─", width))
+	}
+	room := width - 3
+	if room < 1 {
+		room = 1
+	}
+	if strWidth(label) > room {
+		label = clipWidth(label, room)
+	}
+	dashes := width - 2 - strWidth(label) - 1
+	if dashes < 0 {
+		dashes = 0
+	}
+	return dim("─ ") + "\x1b[1m" + label + "\x1b[0m" + dim(" "+strings.Repeat("─", dashes))
+}
+
+func prettyModel(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if i := strings.Index(raw, "["); i >= 0 {
+		raw = strings.TrimSpace(raw[:i])
+	}
+	raw = strings.TrimPrefix(raw, "claude-")
+	parts := strings.FieldsFunc(raw, func(r rune) bool { return r == '-' || r == '_' })
+	if len(parts) == 0 {
+		return ""
+	}
+	var out []string
+	for i := 0; i < len(parts); i++ {
+		if i+1 < len(parts) && digitsOnly(parts[i]) && digitsOnly(parts[i+1]) && len(parts[i+1]) == 1 {
+			out = append(out, parts[i]+"."+parts[i+1])
+			i++
+			continue
+		}
+		out = append(out, titleToken(parts[i]))
+	}
+	return strings.Join(out, " ")
+}
+
+func digitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func titleToken(s string) string {
+	if strings.EqualFold(s, "gpt") {
+		return "GPT"
+	}
+	if s == "" || (s[0] >= '0' && s[0] <= '9') {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func agentHomeLine(agent Agent) string {
@@ -399,65 +889,63 @@ func modeChips(mode string) string {
 	return b.String()
 }
 
-func decisionBody(d Decision, width int) []string {
-	if width < 8 {
-		width = 8
+func promptBlock(content, title string, width int) []string {
+	if width < 1 {
+		width = 1
 	}
-	text := formatDecision(d)
-	var lines []string
-	for _, line := range strings.Split(text, "\n") {
-		lines = append(lines, wrapWidth(line, width)...)
+	top := dim(strings.Repeat("─", width))
+	if title != "" {
+		top = title
 	}
-	return lines
+	return []string{top, content, dim(strings.Repeat("─", width))}
 }
 
-func composerContent(input string, width int) (string, int) {
-	room := width - 4
+func composerLine(input string, width int) (string, int) {
+	const prefix = "> "
+	room := width - strWidth(prefix)
 	if room < 1 {
 		room = 1
 	}
-	if input == "" {
-		return dim(clipWidth("write a task", room)), 3
+	shown := ""
+	if input != "" {
+		shown = tailWidth(input, room)
 	}
-	shown := tailWidth(input, room)
-	return shown, 3 + strWidth(shown)
+	return prefix + shown, strWidth(prefix) + strWidth(shown) + 1
 }
 
-func roundedBox(title string, body []string, width int) []string {
-	if width < 8 {
-		width = 8
+// inputEditPatch reports a same-line update for a typed character or a
+// backspace. Anything else, and input already clipped to the row, needs a
+// full paint.
+func inputEditPatch(input []rune, k key, col, width int) (next []rune, patch string, newCol int, ok bool) {
+	if k.special != "" || col < 1 || width < 3 {
+		return input, "", col, false
 	}
-	inner := width - 2
-	label := " " + title + " "
-	if strWidth(label) > inner {
-		label = clipWidth(label, inner)
+	room := width - 2
+	if strWidth(string(input)) > room {
+		return input, "", col, false
 	}
-	top := "╭" + label + strings.Repeat("─", inner-strWidth(label)) + "╮"
-	if len(body) == 0 {
-		body = []string{""}
+	if k.r == 127 || k.r == 8 {
+		if len(input) == 0 {
+			return input, "", col, true
+		}
+		last := input[len(input)-1]
+		w := runeWidth(last)
+		if w < 1 || col-w < 1 {
+			return input, "", col, false
+		}
+		return input[:len(input)-1], fmt.Sprintf("\x1b[%dD\x1b[K", w), col - w, true
 	}
-	lines := []string{top}
-	for _, line := range body {
-		lines = append(lines, boxMid(line, inner))
+	if k.r < 32 || len(input) >= 4000 {
+		return input, "", col, false
 	}
-	lines = append(lines, "╰"+strings.Repeat("─", inner)+"╯")
-	return lines
-}
-
-func boxMid(content string, inner int) string {
-	room := inner - 2
-	if room < 1 {
-		room = 1
+	w := runeWidth(k.r)
+	if strWidth(string(input))+w > room || col+w > width {
+		return input, "", col, false
 	}
-	padN := room - visibleWidth(content)
-	if padN < 0 {
-		content = clipWidth(stripANSI(content), room)
-		padN = room - strWidth(content)
-	}
-	if padN < 0 {
-		padN = 0
-	}
-	return "│ " + content + strings.Repeat(" ", padN) + " │"
+	next = make([]rune, len(input)+1)
+	copy(next, input)
+	next[len(input)] = k.r
+	return next, string(k.r), col + w, true
 }
 
 func headerLine(left, right string, width int) string {
@@ -478,8 +966,11 @@ func menuLine(plain string, width int, selected bool) string {
 }
 
 func pin(top, bottom []string, height int) ([]string, int) {
-	if height < len(bottom)+1 {
-		height = len(bottom) + 1
+	if height < 1 {
+		height = 1
+	}
+	if len(bottom) > height-1 {
+		bottom = bottom[:height-1]
 	}
 	room := height - len(bottom)
 	if len(top) > room {
@@ -627,17 +1118,70 @@ func visibleWidth(s string) int {
 	return strWidth(stripANSI(s))
 }
 
+func cleanTerm(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == 0x1b {
+			i += skipEscape(s[i:])
+			continue
+		}
+		if r == '\n' {
+			b.WriteByte('\n')
+			i += size
+			continue
+		}
+		if r < 0x20 || r == 0x7f {
+			i += size
+			continue
+		}
+		b.WriteRune(r)
+		i += size
+	}
+	return b.String()
+}
+
+func skipEscape(s string) int {
+	if len(s) < 2 || s[0] != 0x1b {
+		return 1
+	}
+	switch s[1] {
+	case '[':
+		i := 2
+		for i < len(s) {
+			c := s[i]
+			i++
+			if c >= 0x40 && c <= 0x7e {
+				break
+			}
+		}
+		return i
+	case ']':
+		i := 2
+		for i < len(s) {
+			if s[i] == 0x07 {
+				return i + 1
+			}
+			if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+				return i + 2
+			}
+			i++
+		}
+		return len(s)
+	default:
+		return 2
+	}
+}
+
 func stripANSI(s string) string {
 	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
-			i += 2
-			for i < len(s) && s[i] != 'm' {
-				i++
-			}
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			i += skipEscape(s[i:])
 			continue
 		}
 		b.WriteByte(s[i])
+		i++
 	}
 	return b.String()
 }
