@@ -76,14 +76,21 @@ func TestCodexStreamShowsCommandAndAnswer(t *testing.T) {
 }
 
 func TestGrokStreamShowsTextAndTool(t *testing.T) {
-	got := kinds(feedAll(
-		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hi"}}}}`,
-		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"read main.go","kind":"read","status":"pending"}}}`,
-	))
-	for _, want := range []string{"text:Hi", "tool:read main.go"} {
+	run := &liveRun{}
+	for _, line := range []string{
+		`{"type":"system","subtype":"init","session_id":"ses_g","model":"grok-4.7"}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Hi"},{"type":"tool_use","name":"read_file","input":{"path":"main.go"}}]}}`,
+	} {
+		run.accept(line)
+	}
+	got := kinds(run.snapshot())
+	for _, want := range []string{"text:Hi", "tool:read_file  main.go"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q\n%s", want, got)
 		}
+	}
+	if run.sessionID() != "ses_g" {
+		t.Fatal(run.sessionID())
 	}
 }
 
@@ -108,6 +115,70 @@ func TestStartRunShowsStreamedText(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal(got)
+}
+
+func TestStartRunKeepsTheTail(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "claude")
+	script := `#!/bin/sh
+awk 'BEGIN {
+  s = ""
+  for (i = 0; i < 20000; i++) s = s "xxxxxxxxxx"
+  printf "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\n", s
+  print "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"ses_tail\"}"
+  print "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"TAILMARK\"}]}}"
+}'
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run, err := startRun(Agent{Name: "claude", Bin: bin}, "say hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.stop()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if run.finished() && run.sessionID() == "ses_tail" && strings.Contains(kinds(run.snapshot()), "text:TAILMARK") {
+			run.stop()
+			if run.pid != 0 {
+				t.Fatal(run.pid)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("id=%s\n%s", run.sessionID(), kinds(run.snapshot()))
+}
+
+func TestAgentStdinIsNotATerminal(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "claude")
+	script := `#!/bin/sh
+if [ -t 0 ]; then
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"TTY"}]}}'
+else
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"QUIET"}]}}'
+fi
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run, err := startRun(Agent{Name: "claude", Bin: bin}, "say hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.stop()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got := kinds(run.snapshot())
+		if strings.Contains(got, "text:QUIET") && run.finished() {
+			return
+		}
+		if strings.Contains(got, "text:TTY") {
+			t.Fatal(got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal(kinds(run.snapshot()))
 }
 
 func TestResumeArgs(t *testing.T) {

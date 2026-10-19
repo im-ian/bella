@@ -36,6 +36,7 @@ type liveRun struct {
 	stopped bool
 	errText string
 	cmd     *exec.Cmd
+	pid     int
 	notifyR *os.File
 	notifyW *os.File
 }
@@ -101,23 +102,8 @@ func startRun(agent Agent, prompt string) (*liveRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(agent.Bin, sessionArgs(agent, prompt)...)
-	stdout, err := cmd.StdoutPipe()
+	cmd, stdout, stderr, err := startAgent(agent.Bin, sessionArgs(agent, prompt))
 	if err != nil {
-		pr.Close()
-		pw.Close()
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		pr.Close()
-		pw.Close()
-		return nil, err
-	}
-	// Setsid starts a new session, so the agent has no controlling terminal
-	// and cannot redraw over bella. Its pid is the process group id.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
 		return nil, err
@@ -131,16 +117,53 @@ func startRun(agent Agent, prompt string) (*liveRun, error) {
 		lines:   []transcriptLine{{kind: "user", text: prompt, at: time.Now()}},
 		items:   map[string]bool{},
 		cmd:     cmd,
+		pid:     cmd.Process.Pid,
 		notifyR: pr,
 		notifyW: pw,
 	}
-	go run.scan(stdout)
-	go run.scan(stderr)
-	go func() {
-		err := cmd.Wait()
-		run.finish(err)
-	}()
+	go run.watch(cmd, stdout, stderr)
 	return run, nil
+}
+
+func startAgent(bin string, args []string) (*exec.Cmd, io.ReadCloser, io.ReadCloser, error) {
+	cmd := exec.Command(bin, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	in, err := os.Open(os.DevNull)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cmd.Stdin = in
+	// Setsid starts a new session, so the agent has no controlling terminal
+	// and cannot redraw over bella. Its pid is the process group id.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	err = cmd.Start()
+	in.Close()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return cmd, stdout, stderr, nil
+}
+
+func (r *liveRun) watch(cmd *exec.Cmd, stdout, stderr io.Reader) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		r.scan(stdout)
+	}()
+	go func() {
+		defer wg.Done()
+		r.scan(stderr)
+	}()
+	wg.Wait()
+	r.finish(cmd.Wait())
 }
 
 func (r *liveRun) scan(rd io.Reader) {
@@ -149,10 +172,14 @@ func (r *liveRun) scan(rd io.Reader) {
 	for sc.Scan() {
 		r.accept(sc.Text())
 	}
+	if sc.Err() != nil {
+		_, _ = io.Copy(io.Discard, rd)
+	}
 }
 
 func (r *liveRun) finish(err error) {
 	r.mu.Lock()
+	r.pid = 0
 	r.done = true
 	if err != nil && !r.stopped {
 		r.errText = err.Error()
@@ -174,8 +201,8 @@ func (r *liveRun) stop() {
 	r.mu.Lock()
 	r.stopped = true
 	pid := 0
-	if r.cmd != nil && r.cmd.Process != nil {
-		pid = r.cmd.Process.Pid
+	if !r.done {
+		pid = r.pid
 	}
 	r.mu.Unlock()
 	if pid <= 0 {
@@ -219,23 +246,8 @@ func (r *liveRun) reply(prompt string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(agent.Bin, resumeArgs(agent, id, prompt)...)
-	stdout, err := cmd.StdoutPipe()
+	cmd, stdout, stderr, err := startAgent(agent.Bin, resumeArgs(agent, id, prompt))
 	if err != nil {
-		pr.Close()
-		pw.Close()
-		return err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		pr.Close()
-		pw.Close()
-		return err
-	}
-	// Setsid starts a new session, so the agent has no controlling terminal
-	// and cannot redraw over bella. Its pid is the process group id.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
 		return err
@@ -248,6 +260,7 @@ func (r *liveRun) reply(prompt string) error {
 	r.draft = ""
 	r.items = map[string]bool{}
 	r.cmd = cmd
+	r.pid = cmd.Process.Pid
 	r.notifyR = pr
 	r.notifyW = pw
 	r.add(transcriptLine{kind: "user", text: prompt})
@@ -255,12 +268,7 @@ func (r *liveRun) reply(prompt string) error {
 	if oldR != nil {
 		oldR.Close()
 	}
-	go r.scan(stdout)
-	go r.scan(stderr)
-	go func() {
-		err := cmd.Wait()
-		r.finish(err)
-	}()
+	go r.watch(cmd, stdout, stderr)
 	return nil
 }
 
