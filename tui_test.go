@@ -30,6 +30,28 @@ func TestCaretSitsAfterTypedText(t *testing.T) {
 	}
 }
 
+func TestCycleMode(t *testing.T) {
+	if cycleMode("auto", 1) != policyBalance || cycleMode(policyBalance, 1) != policyBest || cycleMode(policyBest, 1) != "auto" {
+		t.Fatal(cycleMode("auto", 1), cycleMode(policyBalance, 1), cycleMode(policyBest, 1))
+	}
+	if cycleMode("auto", -1) != policyBest {
+		t.Fatal(cycleMode("auto", -1))
+	}
+}
+
+func TestHomeShowsModeChips(t *testing.T) {
+	raw := render(screen{width: 60, height: 20, mode: "auto"})
+	plain := stripANSI(raw)
+	for _, want := range []string{"auto", "balance", "fit", "tab mode"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("missing %q\n%s", want, plain)
+		}
+	}
+	if !strings.Contains(raw, "\x1b[7m auto \x1b[0m") {
+		t.Fatal("auto is not the selected chip")
+	}
+}
+
 func TestRenderHomeUsesComposer(t *testing.T) {
 	view := screen{
 		width:  60,
