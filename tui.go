@@ -116,6 +116,22 @@ func runTUI() error {
 			input = nil
 			continue
 		}
+		if k.r == '\t' || k.special == "backtab" {
+			dir := 1
+			if k.special == "backtab" {
+				dir = -1
+			}
+			if err := setMode(&cfg, cycleMode(cfg.Mode, dir)); err != nil {
+				notice = "could not save"
+			} else {
+				notice = ""
+			}
+			if pending != nil {
+				decision := decide(string(input), agents, cfg)
+				pending = &decision
+			}
+			continue
+		}
 		if k.r == 19 { // ctrl-s
 			settings = true
 			cursor = 0
@@ -174,6 +190,26 @@ func settingRows() []settingRow {
 	return rows
 }
 
+func routingModes() []string {
+	return []string{"auto", policyBalance, policyBest}
+}
+
+func cycleMode(current string, dir int) string {
+	modes := routingModes()
+	idx := 0
+	for i, mode := range modes {
+		if mode == current {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + dir) % len(modes)
+	if idx < 0 {
+		idx += len(modes)
+	}
+	return modes[idx]
+}
+
 func setMode(cfg *Config, mode string) error {
 	cfg.Mode = mode
 	return cfg.save()
@@ -214,8 +250,9 @@ func render(s screen) string {
 
 func renderHome(s screen) ([]string, int, int) {
 	top := []string{
-		headerLine("bella", modeLabel(s.mode), s.width),
+		"\x1b[1mbella\x1b[0m",
 		dim(strings.Repeat("─", s.width)),
+		modeChips(s.mode),
 		"",
 	}
 	if len(s.agents) == 0 {
@@ -225,12 +262,12 @@ func renderHome(s screen) ([]string, int, int) {
 		top = append(top, agentHomeLine(agent))
 	}
 	var body []string
-	footer := dim("enter choose    ^S settings    ^C quit")
+	footer := dim("tab mode    enter choose    ^S settings    ^C quit")
 	caretCol := 0
 	if s.pending != nil {
 		body = decisionBody(*s.pending, s.width-4)
 		if s.pending.Found {
-			footer = dim("enter hand off    esc cancel    ^C quit")
+			footer = dim("tab mode    enter hand off    esc cancel    ^C quit")
 		} else {
 			footer = dim("esc close    ^C quit")
 		}
@@ -341,6 +378,25 @@ func modeMenuLabel(mode, current string) string {
 		mark = "(*)"
 	}
 	return mark + "  " + modeLabel(mode)
+}
+
+func modeChips(mode string) string {
+	if mode == "" {
+		mode = "auto"
+	}
+	var b strings.Builder
+	for i, id := range routingModes() {
+		if i > 0 {
+			b.WriteString("  ")
+		}
+		label := " " + modeLabel(id) + " "
+		if id == mode {
+			b.WriteString("\x1b[7m" + label + "\x1b[0m")
+		} else {
+			b.WriteString(dim(label))
+		}
+	}
+	return b.String()
 }
 
 func decisionBody(d Decision, width int) []string {
@@ -633,6 +689,8 @@ func readKey(fd int) (key, error) {
 		return key{special: "right"}, nil
 	case strings.HasSuffix(tail, "D"):
 		return key{special: "left"}, nil
+	case strings.HasSuffix(tail, "Z"):
+		return key{special: "backtab"}, nil
 	default:
 		return key{special: "esc"}, nil
 	}
