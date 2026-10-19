@@ -12,7 +12,7 @@ bella status
 bella init
 ```
 
-`bella "task"` prints the choice and then replaces the terminal with that CLI. With no arguments, bella prints usage for each installed agent.
+`bella "task"` prints the choice and then replaces the terminal with that CLI. With no arguments, bella shows usage and a task box. Enter confirms the handoff. `^S` toggles which agents are used. Those choices are saved to `~/.bella/config.json`.
 
 Usage is read from files the CLIs already write.
 

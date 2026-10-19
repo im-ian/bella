@@ -14,8 +14,10 @@ func main() {
 		args = args[1:]
 	}
 	if len(args) == 0 {
-		writeStatus(os.Stdout, discover(loadConfig()))
-		fmt.Fprintln(os.Stdout, "\nto hand off work: bella \"task\"")
+		if err := runTUI(); err != nil {
+			fmt.Fprintln(os.Stderr, "bella:", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -61,7 +63,7 @@ func main() {
 
 const helpText = `bella hands work to whichever of claude, codex, or grok is installed.
 
-  bella                     show usage for the installed agents
+  bella                     show usage and take a task. ^S opens settings
   bella "fix the flaky test"  choose an agent and hand the terminal to it
   bella plan "review this"    show the choice without handing off
   bella status
