@@ -63,7 +63,7 @@ func main() {
 
 const helpText = `bella hands work to whichever of claude, codex, or grok is installed.
 
-  bella                     show usage and take a task. tab changes mode, ^S opens settings
+  bella                     show usage and take a task. enter opens the conversation, a reply continues it, tab changes mode, ^S opens settings
   bella "fix the flaky test"  choose an agent and hand the terminal to it
   bella plan "review this"    show the choice without handing off
   bella status
